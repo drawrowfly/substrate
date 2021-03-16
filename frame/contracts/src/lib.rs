@@ -127,6 +127,7 @@ use frame_support::{
 use frame_system::Pallet as System;
 use pallet_contracts_primitives::{
 	RentProjectionResult, GetStorageResult, ContractAccessError, ContractExecResult,
+	ContractInstantiateResult, Code,
 };
 
 type CodeHash<T> = <T as frame_system::Config>::Hash;
@@ -666,8 +667,8 @@ where
 {
 	/// Perform a call to a specified contract.
 	///
-	/// This function is similar to `Self::call`, but doesn't perform any address lookups and better
-	/// suitable for calling directly from Rust.
+	/// This function is similar to [`Self::call`], but doesn't perform any address lookups
+	/// and better suitable for calling directly from Rust.
 	///
 	/// It returns the execution result and the amount of used weight.
 	pub fn bare_call(
@@ -685,6 +686,40 @@ where
 		ContractExecResult {
 			exec_result: result.map(|r| r.0).map_err(|r| r.0),
 			gas_consumed,
+		}
+	}
+
+	/// Instantiate a new contract.
+	///
+	/// This function is similar to [`Self::instantiate`], but doesn't perform any address lookups
+	/// and better suitable for calling directly from Rust.
+	///
+	/// It returns the execution result, account id and the amount of used weight.
+	pub fn bare_instantiate(
+		origin: T::AccountId,
+		endowment: BalanceOf<T>,
+		gas_limit: Weight,
+		code: Code<CodeHash<T>>,
+		data: Vec<u8>,
+		salt: Vec<u8>,
+	) -> ContractInstantiateResult<T::AccountId> {
+		let mut gas_meter = GasMeter::new(gas_limit);
+		let schedule = <CurrentSchedule<T>>::get();
+		let mut ctx = ExecutionContext::<T, PrefabWasmModule<T>>::top_level(origin, &schedule);
+		let executable = match code {
+			Code::Upload(binary) => PrefabWasmModule::from_code(binary, &schedule),
+			Code::Existing(hash) => PrefabWasmModule::from_storage(hash, &schedule, &mut gas_meter),
+		};
+		let executable = match executable {
+			Ok(executable) => executable,
+			Err(error) => return ContractInstantiateResult {
+				exec_result: Err(error.into()),
+				gas_consumed: gas_meter.gas_spent(),
+			}
+		};
+		ContractInstantiateResult {
+			exec_result: ctx.instantiate(endowment, &mut gas_meter, executable, data, &salt),
+			gas_consumed: gas_meter.gas_spent(),
 		}
 	}
 

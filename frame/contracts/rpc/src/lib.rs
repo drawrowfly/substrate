@@ -27,20 +27,22 @@ use serde::{Deserialize, Serialize};
 use sp_api::ProvideRuntimeApi;
 use sp_blockchain::HeaderBackend;
 use sp_core::{Bytes, H256};
-use sp_rpc::number;
+use sp_rpc::number::NumberOrHex;
 use sp_runtime::{
 	generic::BlockId,
 	traits::{Block as BlockT, Header as HeaderT},
 	DispatchError,
 };
 use std::convert::{TryFrom, TryInto};
-use pallet_contracts_primitives::ContractExecResult;
+use pallet_contracts_primitives::{Code, ContractExecResult, ContractInstantiateResult};
 
 pub use pallet_contracts_rpc_runtime_api::ContractsApi as ContractsRuntimeApi;
 
 const RUNTIME_ERROR: i64 = 1;
 const CONTRACT_DOESNT_EXIST: i64 = 2;
 const CONTRACT_IS_A_TOMBSTONE: i64 = 3;
+
+pub type Weight = u64;
 
 /// A rough estimate of how much gas a decent hardware consumes per second,
 /// using native execution.
@@ -50,7 +52,11 @@ const CONTRACT_IS_A_TOMBSTONE: i64 = 3;
 /// As 1 gas is equal to 1 weight we base this on the conducted benchmarks which
 /// determined runtime weights:
 /// https://github.com/paritytech/substrate/pull/5446
-const GAS_PER_SECOND: u64 = 1_000_000_000_000;
+const GAS_PER_SECOND: Weight = 1_000_000_000_000;
+
+/// The maximum amount of weight that the call and instantiate rpcs are allowed to consume.
+/// This puts a ceiling on the weight limit that is supplied to the rpc as an argument.
+const GAS_LIMIT: Weight = 5 * GAS_PER_SECOND;
 
 /// A private newtype for converting `ContractAccessError` into an RPC error.
 struct ContractAccessError(pallet_contracts_primitives::ContractAccessError);
@@ -79,9 +85,41 @@ impl From<ContractAccessError> for Error {
 pub struct CallRequest<AccountId> {
 	origin: AccountId,
 	dest: AccountId,
-	value: number::NumberOrHex,
-	gas_limit: number::NumberOrHex,
+	value: NumberOrHex,
+	gas_limit: NumberOrHex,
 	input_data: Bytes,
+}
+
+/// Used to either upload new code or reference an existing one when using `instantiate`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RpcInstantiateCode<Hash> {
+	/// Upload a new wasm binary.
+	Upload(Bytes),
+	/// Reference an existing code hash.
+	Existing(Hash),
+}
+
+impl<Hash> From<RpcInstantiateCode<Hash>> for Code<Hash> {
+	fn from(rpc: RpcInstantiateCode<Hash>) -> Self {
+		match rpc {
+			RpcInstantiateCode::Upload(bytes) => Self::Upload(bytes.to_vec()),
+			RpcInstantiateCode::Existing(hash) => Self::Existing(hash),
+		}
+	}
+}
+
+/// A struct that encodes RPC parameters required to instantiate a new smart-contract.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct InstantiateRequest<AccountId, Hash> {
+	origin: AccountId,
+	endowment: NumberOrHex,
+	gas_limit: NumberOrHex,
+	code: RpcInstantiateCode<Hash>,
+	data: Bytes,
+	salt: Bytes,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,12 +139,30 @@ struct RpcContractExecSuccess {
 pub struct RpcContractExecResult {
 	/// How much gas was consumed by the call. In case of an error this is the amount
 	/// that was used up until the error occurred.
-	gas_consumed: u64,
+	gas_consumed: Weight,
 	/// Additional dynamic human readable error information for debugging. An empty string
 	/// indicates that no additional information is available.
 	debug_message: String,
 	/// Indicates whether the contract execution was successful or not.
 	result: std::result::Result<RpcContractExecSuccess, DispatchError>,
+}
+
+/// An RPC serializable result of contract instantiation.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcContractInstantiateResult<AccountId> {
+	/// See [`RpcContractExecResult::gas_consumed`]
+	gas_consumed: Weight,
+	/// See [`RpcContractExecResult::debug_message`]
+	debug_message: String,
+	/// See [`RpcContractExecResult::result`]
+	///
+	/// # Note
+	///
+	/// On success it returns the account id of the new contract in addition to
+	/// the execution result.
+	result: std::result::Result<(AccountId, RpcContractExecSuccess), DispatchError>,
 }
 
 impl From<ContractExecResult> for RpcContractExecResult {
@@ -129,9 +185,29 @@ impl From<ContractExecResult> for RpcContractExecResult {
 	}
 }
 
+impl<AccountId> From<ContractInstantiateResult<AccountId>> for RpcContractInstantiateResult<AccountId> {
+	fn from(r: ContractInstantiateResult<AccountId>) -> Self {
+		match r.exec_result {
+			Ok((account_id, val)) => RpcContractInstantiateResult {
+				gas_consumed: r.gas_consumed,
+				debug_message: String::new(),
+				result: Ok((account_id, RpcContractExecSuccess {
+					flags: val.flags.bits(),
+					data: val.data.into(),
+				})),
+			},
+			Err(err) => RpcContractInstantiateResult {
+				gas_consumed: r.gas_consumed,
+				debug_message: String::new(),
+				result: Err(err.error),
+			},
+		}
+	}
+}
+
 /// Contracts RPC methods.
 #[rpc]
-pub trait ContractsApi<BlockHash, BlockNumber, AccountId, Balance> {
+pub trait ContractsApi<BlockHash, BlockNumber, AccountId, Balance, Hash> {
 	/// Executes a call to a contract.
 	///
 	/// This call is performed locally without submitting any transactions. Thus executing this
@@ -144,6 +220,19 @@ pub trait ContractsApi<BlockHash, BlockNumber, AccountId, Balance> {
 		call_request: CallRequest<AccountId>,
 		at: Option<BlockHash>,
 	) -> Result<RpcContractExecResult>;
+
+	/// Instantiate a new contract.
+	///
+	/// This call is performed locally without submitting any transactions. Thus the contract
+	/// is not actually created.
+	///
+	/// This method is useful for UIs to dry-run contract instantiations.
+	#[rpc(name = "contracts_instantiate")]
+	fn instantiate(
+		&self,
+		instantiate_request: InstantiateRequest<AccountId, Hash>,
+		at: Option<BlockHash>,
+	) -> Result<RpcContractInstantiateResult<AccountId>>;
 
 	/// Returns the value under a specified storage `key` in a contract given by `address` param,
 	/// or `None` if it is not set.
@@ -184,12 +273,13 @@ impl<C, B> Contracts<C, B> {
 		}
 	}
 }
-impl<C, Block, AccountId, Balance>
+impl<C, Block, AccountId, Balance, Hash>
 	ContractsApi<
 		<Block as BlockT>::Hash,
 		<<Block as BlockT>::Header as HeaderT>::Number,
 		AccountId,
 		Balance,
+		Hash,
 	> for Contracts<C, Block>
 where
 	Block: BlockT,
@@ -199,9 +289,12 @@ where
 		AccountId,
 		Balance,
 		<<Block as BlockT>::Header as HeaderT>::Number,
+		Hash,
 	>,
 	AccountId: Codec,
-	Balance: Codec + TryFrom<number::NumberOrHex>,
+	Balance: Codec + TryFrom<NumberOrHex>,
+	Hash: Codec,
+	Code<Hash>: From<RpcInstantiateCode<Hash>>,
 {
 	fn call(
 		&self,
@@ -221,34 +314,42 @@ where
 			input_data,
 		} = call_request;
 
-		// Make sure that value fits into the balance type.
-		let value: Balance = value.try_into().map_err(|_| Error {
-			code: ErrorCode::InvalidParams,
-			message: format!("{:?} doesn't fit into the balance type", value),
-			data: None,
-		})?;
-
-		// Make sure that gas_limit fits into 64 bits.
-		let gas_limit: u64 = gas_limit.try_into().map_err(|_| Error {
-			code: ErrorCode::InvalidParams,
-			message: format!("{:?} doesn't fit in 64 bit unsigned value", gas_limit),
-			data: None,
-		})?;
-
-		let max_gas_limit = 5 * GAS_PER_SECOND;
-		if gas_limit > max_gas_limit {
-			return Err(Error {
-				code: ErrorCode::InvalidParams,
-				message: format!(
-					"Requested gas limit is greater than maximum allowed: {} > {}",
-					gas_limit, max_gas_limit
-				),
-				data: None,
-			});
-		}
+		let value: Balance = decode_hex(value, "balance")?;
+		let gas_limit: Weight = decode_hex(gas_limit, "weight")?;
+		limit_gas(gas_limit)?;
 
 		let exec_result = api
 			.call(&at, origin, dest, value, gas_limit, input_data.to_vec())
+			.map_err(runtime_error_into_rpc_err)?;
+
+		Ok(exec_result.into())
+	}
+
+	fn instantiate(
+		&self,
+		instantiate_request: InstantiateRequest<AccountId, Hash>,
+		at: Option<<Block as BlockT>::Hash>,
+	) -> Result<RpcContractInstantiateResult<AccountId>> {
+		let api = self.client.runtime_api();
+		let at = BlockId::hash(at.unwrap_or_else(||
+			// If the block hash is not supplied assume the best block.
+			self.client.info().best_hash));
+
+		let InstantiateRequest {
+			origin,
+			endowment,
+			gas_limit,
+			code,
+			data,
+			salt,
+		} = instantiate_request;
+
+		let endowment: Balance = decode_hex(endowment, "balance")?;
+		let gas_limit: Weight = decode_hex(gas_limit, "weight")?;
+		limit_gas(gas_limit)?;
+
+		let exec_result = api
+			.instantiate(&at, origin, endowment, gas_limit, code.into(), data.to_vec(), salt.to_vec())
 			.map_err(runtime_error_into_rpc_err)?;
 
 		Ok(exec_result.into())
@@ -300,8 +401,31 @@ where
 fn runtime_error_into_rpc_err(err: impl std::fmt::Debug) -> Error {
 	Error {
 		code: ErrorCode::ServerError(RUNTIME_ERROR),
-		message: "Runtime trapped".into(),
+		message: "Runtime error".into(),
 		data: Some(format!("{:?}", err).into()),
+	}
+}
+
+fn decode_hex<H: std::fmt::Debug + Copy, T: TryFrom<H>>(from: H, name: &str) -> Result<T> {
+	from.try_into().map_err(|_| Error {
+		code: ErrorCode::InvalidParams,
+		message: format!("{:?} does not fit into the {} type", from, name),
+		data: None,
+	})
+}
+
+fn limit_gas(gas_limit: Weight) -> Result<()> {
+	if gas_limit > GAS_LIMIT {
+		Err(Error {
+			code: ErrorCode::InvalidParams,
+			message: format!(
+				"Requested gas limit is greater than maximum allowed: {} > {}",
+				gas_limit, GAS_LIMIT
+			),
+			data: None,
+		})
+	} else {
+		Ok(())
 	}
 }
 
@@ -327,13 +451,50 @@ mod tests {
 	}
 
 	#[test]
-	fn result_should_serialize_deserialize_properly() {
+	fn instantiate_request_should_serialize_deserialize_properly() {
+		type Req = InstantiateRequest<String, String>;
+		let req: Req = serde_json::from_str(r#"
+		{
+			"origin": "5CiPPseXPECbkjWCa6MnjNokrgYjMqmKndv2rSnekmSK2DjL",
+			"endowment": "0x88",
+			"gasLimit": 42,
+			"code": { "existing": "0x1122" },
+			"data": "0x4299",
+			"salt": "0x9988"
+		}
+		"#).unwrap();
+
+		assert_eq!(req.origin, "5CiPPseXPECbkjWCa6MnjNokrgYjMqmKndv2rSnekmSK2DjL");
+		assert_eq!(req.endowment.into_u256(), 0x88.into());
+		assert_eq!(req.gas_limit.into_u256(), 42.into());
+		assert_eq!(&*req.data, [0x42, 0x99].as_ref());
+		assert_eq!(&*req.salt, [0x99, 0x88].as_ref());
+		let code = match req.code {
+			RpcInstantiateCode::Existing(hash) => hash,
+			_ => panic!("json encoded an existing hash"),
+		};
+		assert_eq!(&code, "0x1122");
+	}
+
+	#[test]
+	fn call_result_should_serialize_deserialize_properly() {
 		fn test(expected: &str) {
 			let res: RpcContractExecResult = serde_json::from_str(expected).unwrap();
 			let actual = serde_json::to_string(&res).unwrap();
 			assert_eq!(actual, expected);
 		}
 		test(r#"{"gasConsumed":5000,"debugMessage":"helpOk","result":{"Ok":{"flags":5,"data":"0x1234"}}}"#);
+		test(r#"{"gasConsumed":3400,"debugMessage":"helpErr","result":{"Err":"BadOrigin"}}"#);
+	}
+
+	#[test]
+	fn instantiate_result_should_serialize_deserialize_properly() {
+		fn test(expected: &str) {
+			let res: RpcContractInstantiateResult<String> = serde_json::from_str(expected).unwrap();
+			let actual = serde_json::to_string(&res).unwrap();
+			assert_eq!(actual, expected);
+		}
+		test(r#"{"gasConsumed":5000,"debugMessage":"helpOk","result":{"Ok":["5CiPP",{"flags":5,"data":"0x1234"}]}}"#);
 		test(r#"{"gasConsumed":3400,"debugMessage":"helpErr","result":{"Err":"BadOrigin"}}"#);
 	}
 }

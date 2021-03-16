@@ -33,6 +33,16 @@ pub struct ContractExecResult {
 	pub gas_consumed: u64,
 }
 
+/// Result type of a `bare_instantiate` call.
+///
+/// The result of a contract execution along with a gas consumed and account id of
+/// the new contract.
+#[derive(Eq, PartialEq, Encode, Decode, RuntimeDebug)]
+pub struct ContractInstantiateResult<AccountId> {
+	pub exec_result: InstantiateResult<AccountId>,
+	pub gas_consumed: u64,
+}
+
 /// Result type of a `get_storage` call.
 pub type GetStorageResult = Result<Option<Vec<u8>>, ContractAccessError>;
 
@@ -118,6 +128,16 @@ impl<T: Into<DispatchError>> From<T> for ExecError {
 	}
 }
 
+#[derive(Eq, PartialEq, Encode, Decode, RuntimeDebug)]
+pub enum Code<Hash> {
+	Upload(Vec<u8>),
+	Existing(Hash),
+}
+
 /// The result that is returned from contract execution. It either contains the output
 /// buffer or an error describing the reason for failure.
 pub type ExecResult = Result<ExecReturnValue, ExecError>;
+
+/// The result that is returned from contract instantiation. It either contains the output
+/// buffer and the account id or an error describing the reason for failure.
+pub type InstantiateResult<AccountId> = Result<(AccountId, ExecReturnValue), ExecError>;
